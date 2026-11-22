@@ -1,7 +1,7 @@
 """双时间资格历史服务 API。"""
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import select, text
@@ -9,7 +9,10 @@ from sqlalchemy.orm import Session
 
 from . import models
 from .db import engine, get_db
+from .deps import current_user
+from .experiments_api import router as experiments_router
 from .seed import seed as run_seed
+from .seed_experiments import seed_experiments as run_seed_experiments
 from .services import diff as diff_svc
 from .services import ledger
 from .services.eligibility import compute_eligibility
@@ -23,6 +26,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(experiments_router)
 
 
 @app.on_event("startup")
@@ -67,16 +71,6 @@ def startup():
 
 
 # ---------------- 认证 ----------------
-def current_user(authorization: str = Header(default=""), db: Session = Depends(get_db)):
-    token = authorization.removeprefix("Bearer ").strip()
-    if not token:
-        raise HTTPException(401, "缺少访问令牌")
-    user = db.execute(select(models.User).where(models.User.token == token)).scalar_one_or_none()
-    if not user:
-        raise HTTPException(401, "令牌无效")
-    return user
-
-
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -432,6 +426,12 @@ def seed_endpoint(db: Session = Depends(get_db), user=Depends(current_user)):
     return run_seed(db)
 
 
+@app.post("/api/seed/experiments")
+def seed_experiments_endpoint(db: Session = Depends(get_db), user=Depends(current_user)):
+    """规则实验演示样本：额外会员（含稀有门店 S003）与改变冻结水位的补传交易。"""
+    return run_seed_experiments(db)
+
+
 @app.post("/api/admin/reset")
 def reset_all(db: Session = Depends(get_db), user=Depends(current_user)):
     """演示/验证用途：清空业务数据（保留账号与语义目录）。
@@ -442,7 +442,10 @@ def reset_all(db: Session = Depends(get_db), user=Depends(current_user)):
     db.execute(
         text(
             "TRUNCATE events, identity_edges, rule_versions, rule_withdrawals, member_directory, "
-            "publications, publication_rows, diffs, diff_items, impacts RESTART IDENTITY CASCADE"
+            "publications, publication_rows, diffs, diff_items, impacts, "
+            "rule_experiments, rule_experiment_versions, sample_snapshots, sample_snapshot_members, "
+            "shadow_runs, shadow_member_results, budget_attributions, precision_reports, release_gates "
+            "RESTART IDENTITY CASCADE"
         )
     )
     db.execute(text("SET session_replication_role = 'origin'"))
@@ -461,5 +464,12 @@ def overview(db: Session = Depends(get_db), user=Depends(current_user)):
         "publications": db.query(models.Publication).count(),
         "diffs": db.query(models.Diff).count(),
         "impacts": db.query(models.Impact).count(),
+        "experiments": db.query(models.RuleExperiment).count(),
+        "experiment_versions": db.query(models.RuleExperimentVersion).count(),
+        "snapshots": db.query(models.SampleSnapshot).count(),
+        "shadow_runs": db.query(models.ShadowRun).count(),
+        "budget_attributions": db.query(models.BudgetAttribution).count(),
+        "precision_reports": db.query(models.PrecisionReport).count(),
+        "release_gates": db.query(models.ReleaseGate).count(),
         "ledger": ledger.verify_chain(db),
     }

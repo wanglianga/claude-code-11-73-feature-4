@@ -34,6 +34,36 @@
 T_b、门店在范围内、未被覆盖 (版本, s, T_b) 的撤回命中」的版本中 (生效起点, 版本号) 最大者。
 并发修订（如 v2、v3 相隔 5 分钟先后修订 v1）由该全序确定性解决，修订链完整保留在账本中。
 
+## 规则实验与预算归因（feature-4）
+
+在不改变冻结基线（成员/交易/身份关系历史版本可固定）的前提下，新增**规则实验与预算归因数据服务**，
+用于在等级规则由「消费额优先」改为「消费额与活跃门店数并重」正式生效前，估计对下季度等级人数、
+积分成本、生日券与门店补贴的影响，并在参数、样本或数据水位变化时解释预测为何改变。
+
+| 组件 | 实现 |
+| --- | --- |
+| 实验目录 | `rule_experiments` / `rule_experiment_versions`：阈值、计分公式、适用门店、候选生效期、权益参数、抽样设计按版本固化；参数指纹 `param_fingerprint`；审批状态机 DRAFT→SUBMITTED→APPROVED/REJECTED |
+| 计分引擎 | `services/scoring.py`：`SPEND_ONLY`（消费额优先）、`SPEND_ACTIVE_COMPOSITE`（消费×w₁+活跃门店数×w₂+笔数×w₃）、`ACTIVE_STORE_GATED`（消费额与活跃门店双门槛）三种确定性公式 + 四类权益成本（积分/生日券/门店补贴/基础） |
+| 样本快照器 | `sample_snapshots` / `sample_snapshot_members`：冻结证据水位、身份图版本、规则集版本、成员集、门店归属与 门店×消费层级×活跃度 分层；补传改变水位时追加快照版本并 `supersedes_snapshot_id` 链接前序，旧结论保留 |
+| 影子分群器 | `shadow_runs` / `shadow_member_results`：同一快照并行现行规则（正式资格引擎）与候选规则，输出逐人等级迁移；FULL 全量精确、SAMPLED 分层抽样估计 |
+| 预算归因器 | `budget_attributions`：按 升级降级×门店×权益类型×规则参数指纹 四维拆分；同店多套候选规则按指纹分列不合并；不可判定门店 estimate/exact 均为 NULL |
+| 精度评估器 | `precision_reports`：分层总量估计、置信区间（正态近似，可配 0.90/0.95/0.99）、相对误差、未覆盖成员、边界阈值成员、不可判定门店；可挂接同快照全量基准做误差对比 |
+| 发布门禁 | `release_gates`：六项原因码（未批准/参数失效/快照过时/未决成员/不可判定/基准偏差），未通过即阻止正式等级发布；通过后物化 `publications` 并回写实验版本与门禁 |
+
+**两条估计路线（抽样设计或全量成员集写入实验版本）**：全量逐人执行得到精确迁移与门店成本，
+消耗更多计算与快照存储；分层抽样按门店/消费层级/活跃度外推总体并附置信区间，迭代更快，
+但对稀有门店与边界阈值成员更不稳定——精度评估器据此要求改用全量或直接报告「不可判定」，
+绝不输出精确补贴额。
+
+**强制红线（均有端到端断言）**：
+
+- 身份拆分/合并审批中的成员 → 未决样本（`migration=PENDING`），不按合并消费计算、不进估计框架；
+- 两套候选规则覆盖同一门店 → 预算归因按规则指纹分别输出，不合并为单一成本；
+- 审批中修改阈值或公式 → 生成新版本、实验回到 DRAFT，发布门禁以 `GATE_STALE_PARAMS` 使旧结果失效；
+- 补传交易改变冻结水位 → 样本快照器生成新快照版本并保留先前预测结论，旧运行门禁判 `GATE_SNAPSHOT_STALE`；
+- 抽样覆盖达不到某门店误差要求 → 精度评估器标记不可判定，预算归因器不输出精确补贴额；
+- 任一预算数字可经 `/api/budget/trace` 回查实验配置、样本/成员集、规则版本指纹与精度说明。
+
 ## 快速启动
 
 ### 方式一：Docker Compose（一键）
@@ -68,6 +98,8 @@ cd frontend
 curl -X POST http://127.0.0.1:8000/api/login -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"admin123"}'
 curl -X POST http://127.0.0.1:8000/api/seed -H 'Authorization: Bearer token-admin-2026'
+# 规则实验演示样本：额外 10 名会员（含稀有门店 S003）+ 1 笔改变冻结水位的补传交易
+curl -X POST http://127.0.0.1:8000/api/seed/experiments -H 'Authorization: Bearer token-admin-2026'
 ```
 
 ## 测试账号
@@ -99,20 +131,33 @@ curl -X POST http://127.0.0.1:8000/api/seed -H 'Authorization: Bearer token-admi
 
 ## 验证方式
 
-### 一键端到端验证（39 项断言）
+### 一键端到端验证
 
 ```bash
-# 后端运行中执行：
-python3 scripts/verify.py            # 默认 http://127.0.0.1:8000
+# 后端运行中执行（两脚本均会重置业务数据并重新灌入种子，可独立重复运行）：
+python3 scripts/verify.py                # 基线：双时间资格/差异归因/影响（39 项断言）
+python3 scripts/verify_experiments.py    # 规则实验与预算归因（50 项断言）
 python3 scripts/verify.py http://localhost:8000
 ```
 
-脚本会重置业务数据、灌入种子，然后断言：任意时点资格（上表全部结论）、更正链前后口径、
-DELTA 语义、发布冻结水位、差异归因（迟到交易/更正/身份拆分/规则修订/规则撤回）、
-下游影响（营销名单进出、门店预算、训练样本标签重述）、链式哈希完整性、幂等重放、
+`verify.py` 断言：任意时点资格、更正链前后口径、DELTA 语义、发布冻结水位、差异归因
+（迟到交易/更正/身份拆分/规则修订/规则撤回）、下游影响、链式哈希完整性、幂等重放、
 追加-only 触发器、投影重建一致性、并发修订确定性解决。
 
-**本仓库交付前已实际执行：`39 通过, 0 失败`。**
+`verify_experiments.py` 断言（本批次交付）：
+
+1. 全量与抽样在**同一快照**的结果对比（普查式抽样估计=全量精确值，并挂接全量基准 CI 对比）；
+2. 身份待核成员列为未决样本、不按合并消费计算、不进估计框架；
+3. 三种计分公式确定性定级（消费优先 / 并重综合分 / 活跃门店双门槛）；
+4. 预算归因按 迁移×门店×权益×规则指纹 四维拆分，逐人成本差额可回算，四类权益之和=TOTAL；
+5. 同店两套候选规则按指纹分别输出、不合并；
+6. 稀有门店 S003 抽样覆盖不达标 → 不可判定且不输出精确补贴额；
+7. 审批中改阈值 → 旧结果门禁 `GATE_STALE_PARAMS` 失效、实验回到 DRAFT；
+8. 补传交易 → 新快照版本（水位推进、链接前序）且旧预测保留、旧运行判快照过时；
+9. 发布门禁拦截未批准/未决成员，并在全部条件满足时放行、物化正式发布；
+10. 任一预算数字经 `/api/budget/trace` 回查实验配置、样本成员集、规则版本指纹与精度说明。
+
+**本仓库交付前已实际执行：基线 `39 通过, 0 失败`；规则实验 `50 通过, 0 失败`。**
 
 ### 手工验证示例
 
@@ -134,7 +179,8 @@ psql postgresql://ccdev:ccdev@127.0.0.1:5432/member_bitemp -c "UPDATE events SET
 
 前端页面同样可完成全部验证：总览（语义目录/重建投影）、接入账（写入与查看哈希链）、
 资格查询（三种口径 + 时间线）、身份关系图（任意时点簇解析）、规则中心、发布与差异
-（冻结发布 → 两两比较 → 查看归因与下游影响）。
+（冻结发布 → 两两比较 → 查看归因与下游影响）、**规则实验**（实验目录与审批 → 影子分群
+→ 迁移/预算四维归因 → 精度 CI 与全量基准对比 → 发布门禁与门控发布 → 预算数字回查）。
 
 ## API 概览
 
@@ -153,6 +199,15 @@ psql postgresql://ccdev:ccdev@127.0.0.1:5432/member_bitemp -c "UPDATE events SET
 | POST/GET | /api/publications | 冻结发布（证据水位/身份图/规则集版本） |
 | POST/GET | /api/diffs | 差异归因 |
 | GET | /api/impacts | 下游影响（可按 dimension/entity 反查） |
+| POST | /api/seed/experiments | 灌入规则实验演示样本（额外会员/稀有门店/补传交易） |
+| POST/GET | /api/experiments · /api/experiments/{id} | 实验目录与版本（参数指纹/审批状态） |
+| POST | /api/experiments/{id}/versions · /transition | 修订参数生成新版本 · 审批状态流转 |
+| GET | /api/experiment-versions/{id}/snapshots · /api/snapshots/{id} | 样本快照版本与冻结成员/未决/分层 |
+| POST | /api/experiments/{id}/shadow · GET /api/shadow/runs/{id} | 影子分群（FULL/SAMPLED）与迁移/预算/精度详情 |
+| POST | /api/shadow/runs/{id}/benchmark | 挂接同快照全量基准对比 |
+| GET | /api/shadow/runs/{id}/budget · /api/budget/attributions | 预算归因（可按门店/权益/迁移过滤，跨运行看同店多规则分列） |
+| GET | /api/budget/trace | 预算数字全链路回查（实验配置/样本/规则版本/精度/逐人） |
+| POST | /api/shadow/runs/{id}/gate · /release · GET /api/gates | 发布门禁检查、门控正式发布 |
 | POST | /api/admin/rebuild | 从事件账重建全部投影 |
 | GET | /api/admin/ledger/verify | 链式哈希校验 |
 | POST | /api/admin/reset | 清空业务数据（演示用） |

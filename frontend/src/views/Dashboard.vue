@@ -17,6 +17,12 @@
         </div>
         <div class="label">账本链式哈希（{{ ov.ledger?.checked ?? 0 }} 条）</div>
       </div>
+      <div class="stat"><div class="num">{{ ov.experiments ?? 0 }}</div><div class="label">规则实验</div></div>
+      <div class="stat"><div class="num">{{ ov.experiment_versions ?? 0 }}</div><div class="label">实验版本</div></div>
+      <div class="stat"><div class="num">{{ ov.snapshots ?? 0 }}</div><div class="label">样本快照</div></div>
+      <div class="stat"><div class="num">{{ ov.shadow_runs ?? 0 }}</div><div class="label">影子分群运行</div></div>
+      <div class="stat"><div class="num">{{ ov.budget_attributions ?? 0 }}</div><div class="label">预算归因行</div></div>
+      <div class="stat"><div class="num">{{ ov.release_gates ?? 0 }}</div><div class="label">发布门禁</div></div>
     </div>
 
     <div class="grid cols-2" style="margin-top:16px">

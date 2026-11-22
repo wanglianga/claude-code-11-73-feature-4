@@ -121,6 +121,45 @@ def merge_edges_at(db: Session, biz_t: datetime, sys_t: datetime) -> list[models
     return out
 
 
+def pending_edges_at(db: Session, biz_t: datetime, sys_t: datetime) -> list[models.IdentityEdge]:
+    """在 (biz_t, sys_t) 口径下仍然有效的待核关系边（identity_pending，未被拆分/撤销闭合）。"""
+    edges = db.execute(
+        select(models.IdentityEdge).where(models.IdentityEdge.relation == "pending")
+    ).scalars().all()
+    out = []
+    for e in edges:
+        if e.sys_from > sys_t or e.biz_from > biz_t:
+            continue
+        if (
+            e.sys_to is not None
+            and e.sys_to <= sys_t
+            and e.biz_to is not None
+            and e.biz_to <= biz_t
+        ):
+            continue
+        out.append(e)
+    return out
+
+
+def pending_members_at(db: Session, biz_t: datetime, sys_t: datetime) -> dict[str, list[dict]]:
+    """返回 {member_key: [待核关系说明]}；成员身份正在拆分/合并审批时列为未决。
+
+    待核(pending)边仅记录不参与资格计算；实验快照必须把这些成员标记为未决样本，
+    不能按合并消费计算影子分群。
+    """
+    result: dict[str, list[dict]] = {}
+    for e in pending_edges_at(db, biz_t, sys_t):
+        note = {
+            "edge_id": e.id,
+            "relation_event_id": e.relation_event_id,
+            "peer": e.member_b if e.member_a else e.member_a,
+            "reason": e.reason or "身份关系待核/拆分审批中",
+        }
+        result.setdefault(e.member_a, []).append(note)
+        result.setdefault(e.member_b, []).append({**note, "peer": e.member_a})
+    return result
+
+
 def cluster_at(db: Session, member_key: str, biz_t: datetime, sys_t: datetime) -> set[str]:
     """并查集求 member 在指定双时点的身份簇。"""
     edges = merge_edges_at(db, biz_t, sys_t)
